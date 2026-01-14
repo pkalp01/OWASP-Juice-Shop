@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Deploy an EC2 instance with Juice Shop for security assessment with VPC, public and private subnets."
+
+Parameters:
+  KeyPairName:
+    Description: "Name of an existing EC2 KeyPair to enable SSH access to the instance"
+    Type: "AWS::EC2::KeyPair::KeyName"
+    ConstraintDescription: "Must be the name of an existing EC2 KeyPair."
+    Default: test1
+
+  InstanceName:
+    Description: "Name of the EC2 instance for identification."
+    Type: String
+    Default: "VulnerableInstance"
+
+  AMIId:
+    Description: "The AMI ID to be used for the EC2 instance. Default is Amazon Linux 2023."
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+
+  VpcCidr:
+    Description: "CIDR block for the VPC."
+    Default: "10.0.0.0/16"
+    Type: String
+
+  PublicSubnetCidr:
+    Description: "CIDR block for the public subnet."
+    Default: "10.0.1.0/24"
+    Type: String
+
+  PrivateSubnetCidr:
+    Description: "CIDR block for the private subnet."
+    Default: "10.0.2.0/24"
+    Type: String
+
+Resources:
+  # Create the VPC
+  MidtermVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: "ENPM665-midterm-vpc1"
+
+  # Create an Internet Gateway
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+
+  # Attach the Internet Gateway to the VPC
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref MidtermVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create a Public Subnet
+  PublicSubnet:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref MidtermVPC
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      Tags:
+        - Key: Name
+          Value: "Public Subnet"
+
+  # Create a Private Subnet
+  PrivateSubnet:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref MidtermVPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      Tags:
+        - Key: Name
+          Value: "Private Subnet"
+
+  # Create a Route Table for the Public Subnet
+  PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref MidtermVPC
+      Tags:
+        - Key: Name
+          Value: "Public Route Table"
+
+  # Associate the Public Subnet with the Route Table
+  PublicSubnetRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Create a route to the Internet in the Public Route Table
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  # Create a Security Group for the EC2 instance
+  WebServerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !Ref MidtermVPC
+      GroupDescription: "Allow SSH, HTTP, and HTTPS access to the EC2 instance"
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: "0.0.0.0/0"  # Allow HTTP access
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: "0.0.0.0/0"  # Allow HTTPS access
+        - IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: "0.0.0.0/0"  # Allow SSH access
+
+  # Create an EC2 instance in the Public Subnet
+  VulnerableEC2Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: "t2.medium"
+      KeyName: !Ref KeyPairName
+      ImageId: !Ref AMIId
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true  # Associate public IP here
+          SubnetId: !Ref PublicSubnet
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref WebServerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            LOG_FILE="/var/log/user_data.log"
+
+            # Update the instance
+            echo "Updating the instance" | tee -a $LOG_FILE
+            yum update -y 2>&1 | tee -a $LOG_FILE
+
+            # Install required software (Node.js, NPM, and MariaDB)
+            echo "Installing Node.js and MariaDB" | tee -a $LOG_FILE
+            curl -sL https://rpm.nodesource.com/setup_24.x | bash - 2>&1 | tee -a $LOG_FILE
+            yum install -y nodejs mariadb105-server.x86_64 git 2>&1 | tee -a $LOG_FILE
+
+            # Start and enable MariaDB
+            echo "Starting and enabling MariaDB" | tee -a $LOG_FILE
+            systemctl start mariadb 2>&1 | tee -a $LOG_FILE
+            systemctl enable mariadb 2>&1 | tee -a $LOG_FILE
+
+            # Set up MariaDB (vulnerable root password)
+            echo "Setting up MariaDB" | tee -a $LOG_FILE
+            mysql -u root -e "SET PASSWORD FOR root@'localhost' = PASSWORD('vulnerable');" 2>&1 | tee -a $LOG_FILE
+            mysql -u root -p'vulnerable' -e "CREATE DATABASE juice_shop;" 2>&1 | tee -a $LOG_FILE
+
+            # Ensure /opt directory exists and has the correct permissions
+            echo "Ensuring /opt directory exists" | tee -a $LOG_FILE
+            if [ ! -d /opt ]; then
+              mkdir /opt 2>&1 | tee -a $LOG_FILE
+            fi
+            chown -R ec2-user:ec2-user /opt 2>&1 | tee -a $LOG_FILE
+            chmod -R 755 /opt 2>&1 | tee -a $LOG_FILE
+
+            # Clone the Juice Shop repository to /opt
+            echo "Cloning Juice Shop repository to /opt" | tee -a $LOG_FILE
+            git clone https://github.com/juice-shop/juice-shop.git /opt/juice-shop 2>&1 | tee -a $LOG_FILE
+
+            # Set permissions for the juice-shop directory
+            chown -R ec2-user:ec2-user /opt/juice-shop 2>&1 | tee -a $LOG_FILE
+            cd /opt/juice-shop 2>&1 | tee -a $LOG_FILE
+            echo "In the Juice Shop directory" | tee -a $LOG_FILE
+
+            # Set permissions for the data directory if it exists
+            if [ -d "/opt/juice-shop/data" ]; then
+              chmod -R 755 /opt/juice-shop/data 2>&1 | tee -a $LOG_FILE
+            else
+              echo "Directory 'data/' does not exist, skipping chmod." | tee -a $LOG_FILE
+            fi
+
+            echo "Installing dependencies and starting Juice Shop" | tee -a $LOG_FILE
+            (cd /opt/juice-shop && sudo npm install 2>&1 | tee -a $LOG_FILE)
+            if [ $? -ne 0 ]; then
+              echo "npm install failed. Exiting." | tee -a $LOG_FILE
+            exit 1
+            fi
+            (cd /opt/juice-shop && sudo npm start 2>&1 | tee -a $LOG_FILE)
+
+            
+
+
+           
+
+  
